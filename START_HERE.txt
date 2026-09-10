@@ -1,0 +1,9 @@
+THERMAL INTELLIGENCE — START HERE
+
+1. Extract the ZIP.
+2. Double-click RUN_WEBSITE.bat.
+3. Wait for the first-time package installation.
+4. Browser opens automatically at http://127.0.0.1:8000.
+5. The site auto-loads live NASA FIRMS data using the configured local MAP_KEY. If FIRMS or Overpass is temporarily unavailable, it falls back to demo data.
+
+No PowerShell activation command is needed.
