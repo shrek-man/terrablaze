@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn>=0.30
+pandas>=2.2
+numpy>=1.26
+requests>=2.32
+geopandas>=1.0
+shapely>=2.0
+scikit-learn>=1.5
+pyogrio>=0.9

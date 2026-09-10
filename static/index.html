@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Thermal Intelligence | SIH 2026</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">🔥</div>
+    <div>
+      <h1>Thermal Intelligence</h1>
+      <p>SIH 2026 · Bengaluru Industrial Fire Monitoring</p>
+    </div>
+  </div>
+  <div class="status"><span id="statusDot"></span><span id="statusText">Demo mode</span></div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <section class="panel">
+      <h2>Data Sources</h2>
+      <div class="statusbox"><span>FIRMS key</span><b id="keyStatus">Not set</b></div>
+      <label>NASA FIRMS MAP_KEY</label>
+      <div class="key-row"><input id="firmsKey" type="password" placeholder="Paste MAP_KEY" autocomplete="off"><button id="saveKey" class="key-btn">Save</button></div>
+      <button id="clearKey" class="text-btn">Clear saved key</button>
+      <label>Satellite source</label>
+      <select id="firmsSource">
+        <option value="VIIRS_SNPP_NRT">VIIRS SNPP NRT</option>
+        <option value="VIIRS_NOAA20_NRT">VIIRS NOAA-20 NRT</option>
+        <option value="VIIRS_NOAA21_NRT">VIIRS NOAA-21 NRT</option>
+        <option value="MODIS_NRT">MODIS NRT</option>
+      </select>
+      <label>Days of FIRMS data</label>
+      <input id="days" type="number" min="1" max="30" value="2">
+      <label>Industrial buffer (km)</label>
+      <input id="bufferKm" type="number" min="1" max="15" step="0.5" value="5">
+      <div class="button-row">
+        <button id="loadLive" class="primary">Load live data</button>
+        <button id="loadDemo">Demo</button>
+      </div>
+      <p class="hint">The website will ask for your NASA FIRMS MAP_KEY when you click <b>Load live data</b>. The key is kept only in this browser session.</p>
+    </section>
+
+    <section class="panel">
+      <h2>GIS Filters</h2>
+      <label class="check"><input id="onlyIndustrial" type="checkbox"> Only inside industrial buffer</label>
+      <label>Minimum risk</label>
+      <input id="minRisk" type="range" min="0" max="100" value="0">
+      <div class="range-value"><span>0</span><strong id="riskValue">0</strong></div>
+      <label class="check"><input id="showMovement" type="checkbox" checked> Show movement paths</label>
+    </section>
+
+    <section class="panel">
+      <h2>GIS Pipeline</h2>
+      <div class="pipeline">
+        <div><b>NASA FIRMS</b><span>thermal anomalies</span></div>
+        <div><b>OSM + Overpass</b><span>industrial context</span></div>
+        <div><b>GeoPandas + Shapely</b><span>buffer · join · distance</span></div>
+        <div><b>Temporal analysis</b><span>movement · persistence</span></div>
+        <div><b>scikit-learn</b><span>prototype anomaly score</span></div>
+        <div><b>Folium/Leaflet UI</b><span>interactive map</span></div>
+      </div>
+    </section>
+  </aside>
+
+  <section class="content">
+    <div class="cards">
+      <div class="card"><span>Thermal detections</span><strong id="countDetections">0</strong></div>
+      <div class="card"><span>OSM industrial features</span><strong id="countOsm">0</strong></div>
+      <div class="card"><span>Inside buffer</span><strong id="countBuffer">0</strong></div>
+      <div class="card"><span>High-risk anomalies</span><strong id="countHigh">0</strong></div>
+      <div class="card"><span>Movement paths</span><strong id="countPaths">0</strong></div>
+    </div>
+
+    <div class="map-panel">
+      <div class="map-header">
+        <div>
+          <h2>GIS Intelligence Map</h2>
+          <p>FIRMS anomalies enriched with OSM infrastructure and spatial analysis</p>
+        </div>
+        <div class="legend">
+          <span><i class="dot thermal"></i> Thermal</span>
+          <span><i class="dot high"></i> High risk</span>
+          <span><i class="dot facility"></i> OSM industrial</span>
+          <span class="line-key">━━ movement</span>
+        </div>
+      </div>
+      <div id="map"></div>
+    </div>
+
+    <div class="lower">
+      <section class="panel table-panel">
+        <div class="panel-title"><h2>Detection Analysis</h2><button id="exportBtn">Export CSV</button></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Time</th><th>FRP</th><th>Nearest facility</th><th>Distance</th><th>Buffer</th><th>Risk</th><th>Classification</th>
+            </tr></thead>
+            <tbody id="eventsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel detail-panel">
+        <h2>Selected Detection</h2>
+        <div id="detail">
+          <div class="empty">Click a thermal point on the map.</div>
+        </div>
+      </section>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>Prototype: thermal anomaly ≠ confirmed fire.</span>
+  <span>Data: NASA FIRMS · OpenStreetMap/Overpass · GeoPandas · Shapely · scikit-learn</span>
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/static/app.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,10 @@
+THERMAL INTELLIGENCE — SIH 2026
+
+1. Extract the ZIP.
+2. Double-click RUN_WEBSITE.bat.
+3. Wait for the first-time package installation.
+4. The browser opens at http://127.0.0.1:8000.
+5. Click Load live data. The website asks for the NASA FIRMS MAP_KEY if one is not already in this browser session.
+
+You do NOT need to activate the virtual environment manually.
+Keep the black terminal window open while the website is running.
