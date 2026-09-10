@@ -48,4 +48,9 @@ The anomaly score is a prototype signal. It is not a validated industrial-fire c
 
 
 
+
+changing days of FIRMS data doesnt work right now
+
+
+
 just click the .bat file and refresh if any errors
