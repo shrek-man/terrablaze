@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -33,9 +34,17 @@ OVERPASS_ENDPOINTS = (
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 )
 OFFLINE_INDIA_BOUNDARY = APP_DIR / "data" / "india_boundary.geojson"
+HISTORY_DB = APP_DIR / "data" / "thermaltrace_history.sqlite3"
 GEOD = Geod(ellps="WGS84")
 NEARBY_SITE_LIMIT_KM = 100.0
 INCIDENT_RADIUS_KM = 1.5
+HISTORY_LOOKBACK_DAYS = 365
+HISTORY_MIN_DAYS = 3
+HISTORY_OVERPASS_HOUR_TOLERANCE = 2
+OSM_QUERY_GRID_DEGREES = 0.5
+# Smaller requests keep Overpass from timing out when FIRMS detections cover
+# several states. Failed batches are split once and cached sites remain usable.
+OSM_QUERY_BATCH_SIZE = 4
 
 RECENT_SOURCES = {
     "VIIRS_NOAA21_NRT": {"satellite": "NOAA-21", "sensor": "VIIRS"},
@@ -147,6 +156,276 @@ def normalize_firms(df):
         & df["longitude"].between(-180, 180)
     )
     return df.loc[valid_coordinates].reset_index(drop=True)
+
+
+def _connect_history_db():
+    HISTORY_DB.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(HISTORY_DB, timeout=20)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS firms_observations (
+            observation_id TEXT PRIMARY KEY,
+            observed_at TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            frp REAL,
+            bright_ti4 REAL,
+            bright_ti5 REAL,
+            daynight TEXT,
+            satellite_name TEXT NOT NULL,
+            sensor_name TEXT,
+            instrument TEXT
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_firms_observed_at ON firms_observations(observed_at)")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS osm_site_cache (
+            osm_key TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            lat REAL NOT NULL,
+            lon REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.commit()
+    return connection
+
+
+def _history_columns(frame):
+    frame = frame.copy()
+    for column in (
+        "historical_sample_count", "historical_sample_days", "historical_baseline_frp",
+        "historical_baseline_temp", "historical_frp_delta", "historical_frp_change_pct",
+        "historical_temp_delta", "historical_anomaly_score",
+    ):
+        frame[column] = 0 if column in {"historical_sample_count", "historical_sample_days"} else np.nan
+    return frame
+
+
+def _load_history_window(start_at, end_at):
+    connection = _connect_history_db()
+    try:
+        return pd.read_sql_query(
+            """SELECT observed_at AS datetime_utc, latitude, longitude, frp, bright_ti4,
+                      bright_ti5, daynight, satellite_name, sensor_name, instrument
+               FROM firms_observations WHERE observed_at >= ? AND observed_at <= ?""",
+            connection,
+            params=(start_at.isoformat(), end_at.isoformat()),
+        )
+    finally:
+        connection.close()
+
+
+def _save_firms_history(frame):
+    if frame.empty:
+        return 0
+    records = []
+    for row in frame.to_dict(orient="records"):
+        observed_at = pd.to_datetime(row.get("datetime_utc"), errors="coerce", utc=True)
+        satellite_name = str(row.get("satellite_name") or "").strip()
+        latitude = pd.to_numeric(row.get("latitude"), errors="coerce")
+        longitude = pd.to_numeric(row.get("longitude"), errors="coerce")
+        if pd.isna(observed_at) or pd.isna(latitude) or pd.isna(longitude) or not satellite_name:
+            continue
+        instrument = str(row.get("instrument") or "")
+        identity = f"{satellite_name}|{instrument}|{observed_at.isoformat()}|{latitude:.5f}|{longitude:.5f}"
+        observation_id = hashlib.sha1(identity.encode("utf-8")).hexdigest()
+        records.append((
+            observation_id, observed_at.isoformat(), float(latitude), float(longitude),
+            _finite_or_none(row.get("frp")), _finite_or_none(row.get("bright_ti4")),
+            _finite_or_none(row.get("bright_ti5")), str(row.get("daynight") or "").upper(),
+            satellite_name, str(row.get("sensor_name") or ""), instrument,
+        ))
+    if not records:
+        return 0
+    connection = _connect_history_db()
+    try:
+        before = connection.total_changes
+        connection.executemany(
+            """INSERT OR IGNORE INTO firms_observations
+               (observation_id, observed_at, latitude, longitude, frp, bright_ti4, bright_ti5,
+                daynight, satellite_name, sensor_name, instrument)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        connection.commit()
+        return connection.total_changes - before
+    finally:
+        connection.close()
+
+
+def _finite_or_none(value):
+    number = pd.to_numeric(value, errors="coerce")
+    return None if pd.isna(number) or not np.isfinite(number) else float(number)
+
+
+def _baseline_score(current, values, minimum_threshold):
+    values = pd.to_numeric(pd.Series(values), errors="coerce").dropna().to_numpy(dtype=float)
+    if current is None or not len(values):
+        return np.nan, np.nan, 0.0
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    threshold = max(float(minimum_threshold), abs(median) * 0.2, 3.0 * 1.4826 * mad)
+    delta = float(current) - median
+    score = float(np.clip((delta - threshold) / max(threshold, 1.0), 0, 1))
+    return median, delta, score
+
+
+def _add_historical_baseline(current, history):
+    """Compare each FIRMS observation with prior local detections from like overpasses."""
+    current = _history_columns(current)
+    history = pd.DataFrame(history).copy()
+    if current.empty:
+        return current
+    current["datetime_utc"] = pd.to_datetime(current["datetime_utc"], errors="coerce", utc=True)
+    reference_columns = ["datetime_utc", "latitude", "longitude", "frp", "bright_ti4", "bright_ti5", "daynight", "satellite_name", "sensor_name", "instrument"]
+    history = history.reindex(columns=reference_columns)
+    history["datetime_utc"] = pd.to_datetime(history["datetime_utc"], errors="coerce", utc=True)
+    current_reference = current.reindex(columns=reference_columns)
+    history = pd.concat([history, current_reference], ignore_index=True)
+    history = history.dropna(subset=["datetime_utc", "latitude", "longitude"])
+    if history.empty:
+        return current
+    history = history.drop_duplicates(subset=["datetime_utc", "latitude", "longitude", "satellite_name", "instrument"])
+    history["brightness_delta"] = pd.to_numeric(history["bright_ti4"], errors="coerce") - pd.to_numeric(history["bright_ti5"], errors="coerce")
+    history["observation_date"] = history["datetime_utc"].dt.strftime("%Y-%m-%d")
+    history["observation_hour"] = history["datetime_utc"].dt.hour + history["datetime_utc"].dt.minute / 60
+    history_coordinates = np.radians(history[["latitude", "longitude"]].to_numpy(dtype=float))
+    spatial_index = BallTree(history_coordinates, metric="haversine")
+    current_coordinates = np.radians(current[["latitude", "longitude"]].to_numpy(dtype=float))
+    matches = spatial_index.query_radius(current_coordinates, r=INCIDENT_RADIUS_KM / 6371.0088)
+
+    for position, row in enumerate(current.itertuples(index=False)):
+        observed_at = getattr(row, "datetime_utc")
+        if pd.isna(observed_at):
+            continue
+        platform = str(getattr(row, "satellite_name", "") or "")
+        if not platform:
+            continue
+        candidates = history.iloc[matches[position]].copy()
+        candidates = candidates.loc[
+            (candidates["satellite_name"].astype(str) == platform)
+            & (candidates["datetime_utc"] < observed_at.normalize())
+            & (candidates["datetime_utc"] >= observed_at - pd.Timedelta(days=HISTORY_LOOKBACK_DAYS))
+        ]
+        daynight = str(getattr(row, "daynight", "") or "").upper()
+        if daynight in {"D", "N"}:
+            candidates = candidates.loc[candidates["daynight"].astype(str).str.upper() == daynight]
+        hour = observed_at.hour + observed_at.minute / 60
+        historical_hours = candidates["observation_hour"]
+        hour_delta = (historical_hours - hour).abs()
+        candidates = candidates.loc[np.minimum(hour_delta, 24 - hour_delta) <= HISTORY_OVERPASS_HOUR_TOLERANCE]
+        if candidates.empty:
+            continue
+        daily = candidates.groupby("observation_date", as_index=False).agg(
+            frp=("frp", "median"), brightness_delta=("brightness_delta", "median"),
+        )
+        sample_days = int(len(daily))
+        current.at[current.index[position], "historical_sample_count"] = int(len(candidates))
+        current.at[current.index[position], "historical_sample_days"] = sample_days
+        if sample_days < HISTORY_MIN_DAYS:
+            continue
+
+        current_frp = _finite_or_none(getattr(row, "frp", None))
+        current_brightness = _finite_or_none(getattr(row, "bright_ti4", None))
+        current_brightness5 = _finite_or_none(getattr(row, "bright_ti5", None))
+        current_brightness_delta = (
+            current_brightness - current_brightness5
+            if current_brightness is not None and current_brightness5 is not None else None
+        )
+        baseline_frp, frp_delta, frp_score = _baseline_score(current_frp, daily["frp"], 5.0)
+        baseline_temp, temp_delta, temp_score = _baseline_score(current_brightness_delta, daily["brightness_delta"], 5.0)
+        baseline_index = current.index[position]
+        current.at[baseline_index, "historical_baseline_frp"] = baseline_frp
+        current.at[baseline_index, "historical_baseline_temp"] = baseline_temp
+        current.at[baseline_index, "historical_frp_delta"] = frp_delta
+        current.at[baseline_index, "historical_temp_delta"] = temp_delta
+        current.at[baseline_index, "historical_anomaly_score"] = max(frp_score, temp_score)
+        if baseline_frp is not None and baseline_frp > 0 and frp_delta is not None:
+            current.at[baseline_index, "historical_frp_change_pct"] = 100 * frp_delta / baseline_frp
+    return current
+
+
+def _clip_firms_to_boundary(firms, india_boundary):
+    firms = normalize_firms(firms)
+    if firms.empty or india_boundary is None:
+        return firms
+    inside = [india_boundary.covers(Point(lon, lat)) for lat, lon in zip(firms.latitude, firms.longitude)]
+    return firms.loc[inside].reset_index(drop=True)
+
+
+def add_local_historical_context(firms):
+    """Score against earlier local detections, then persist this request for future baselines."""
+    firms = _history_columns(normalize_firms(firms))
+    timestamps = pd.to_datetime(firms.get("datetime_utc", pd.Series(dtype="datetime64[ns, UTC]")), errors="coerce", utc=True)
+    valid_timestamps = timestamps.dropna()
+    try:
+        if len(valid_timestamps):
+            history = _load_history_window(
+                valid_timestamps.min() - pd.Timedelta(days=HISTORY_LOOKBACK_DAYS),
+                valid_timestamps.max(),
+            )
+        else:
+            history = pd.DataFrame()
+        firms = _add_historical_baseline(firms, history)
+        saved = _save_firms_history(firms)
+        connection = _connect_history_db()
+        try:
+            total, days, last_seen = connection.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT substr(observed_at, 1, 10)), MAX(observed_at) FROM firms_observations"
+            ).fetchone()
+        finally:
+            connection.close()
+        return firms, {
+            "available": True, "stored_observations": int(total or 0),
+            "stored_days": int(days or 0), "new_observations": int(saved),
+            "last_observation": last_seen or "",
+            "baseline_hotspots": int((pd.to_numeric(firms["historical_sample_days"], errors="coerce") >= HISTORY_MIN_DAYS).sum()),
+        }
+    except Exception:
+        logging.exception("Could not update the local FIRMS history database")
+        return firms, {
+            "available": False, "stored_observations": 0, "stored_days": 0,
+            "new_observations": 0, "last_observation": "", "baseline_hotspots": 0,
+        }
+
+
+def _save_osm_site_cache(sites):
+    if not sites:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    records = []
+    for site in sites:
+        osm_id = site.get("osm_id")
+        osm_type = site.get("osm_type") or "feature"
+        key = f"{osm_type}/{osm_id}" if osm_id is not None else f"{site.get('lat')},{site.get('lon')},{site.get('name')}"
+        records.append((key, str(site.get("name") or "Unnamed mapped feature"), str(site.get("kind") or "industrial"), float(site["lat"]), float(site["lon"]), now))
+    connection = _connect_history_db()
+    try:
+        connection.executemany(
+            """INSERT INTO osm_site_cache (osm_key, name, kind, lat, lon, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(osm_key) DO UPDATE SET name=excluded.name, kind=excluded.kind,
+               lat=excluded.lat, lon=excluded.lon, updated_at=excluded.updated_at""",
+            records,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _load_osm_site_cache():
+    if not HISTORY_DB.exists():
+        return [], ""
+    connection = _connect_history_db()
+    try:
+        rows = connection.execute(
+            "SELECT name, kind, lat, lon, osm_key, updated_at FROM osm_site_cache ORDER BY updated_at DESC LIMIT 50000"
+        ).fetchall()
+    finally:
+        connection.close()
+    sites = [{"name": row[0], "kind": row[1], "lat": row[2], "lon": row[3], "osm_id": row[4], "osm_type": "cached"} for row in rows]
+    return sites, rows[0][5] if rows else ""
 
 
 def to_points(df):
@@ -354,7 +633,7 @@ def _post_overpass(query, timeout):
                 endpoint,
                 data=query,
                 headers={"User-Agent": "ThermalTrace/1.0"},
-                timeout=(15, timeout),
+                timeout=(6, timeout),
             )
             response.raise_for_status()
             payload = response.json()
@@ -370,9 +649,84 @@ def _post_overpass(query, timeout):
     raise requests.RequestException("All Overpass servers failed: " + " | ".join(errors))
 
 
-def fetch_osm():
+def _osm_search_groups(firms, india_boundary):
+    points = normalize_firms(firms)
+    if points.empty:
+        return []
+    if india_boundary is not None:
+        inside = [india_boundary.covers(Point(lon, lat)) for lat, lon in zip(points.latitude, points.longitude)]
+        points = points.loc[inside].copy()
+    if points.empty:
+        return []
+    points["grid_lat"] = np.floor(points["latitude"] / OSM_QUERY_GRID_DEGREES).astype(int)
+    points["grid_lon"] = np.floor(points["longitude"] / OSM_QUERY_GRID_DEGREES).astype(int)
+    groups = []
+    for _, group in points.groupby(["grid_lat", "grid_lon"], sort=False):
+        lat = float(group["latitude"].mean())
+        lon = float(group["longitude"].mean())
+        _, _, distances = GEOD.inv(
+            np.full(len(group), lon), np.full(len(group), lat),
+            group["longitude"].to_numpy(dtype=float), group["latitude"].to_numpy(dtype=float),
+        )
+        radius_km = NEARBY_SITE_LIMIT_KM + float(np.max(distances, initial=0)) / 1000 + 2
+        groups.append((lat, lon, int(np.ceil(radius_km * 1000))))
+    return groups
+
+
+def _osm_sites_query(groups):
+    selectors = []
+    for lat, lon, radius_m in groups:
+        around = f"(around:{radius_m},{lat:.5f},{lon:.5f})"
+        selectors.extend((
+            f'  nwr{around}["industrial"];',
+            f'  nwr{around}["landuse"="industrial"];',
+            f'  nwr{around}["power"~"plant|generator"];',
+            f'  nwr{around}["man_made"="works"];',
+        ))
+    return "[out:json][timeout:25];\n(\n" + "\n".join(selectors) + "\n);\nout center tags;"
+
+
+def _osm_elements_to_sites(elements, india_boundary):
+    rows = []
+    seen = set()
+    for element in elements:
+        identity = (element.get("type"), element.get("id"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        tags = element.get("tags", {})
+        if "lat" in element and "lon" in element:
+            lat, lon = element["lat"], element["lon"]
+        else:
+            center = element.get("center", {})
+            lat, lon = center.get("lat"), center.get("lon")
+        if lat is None or lon is None:
+            continue
+        lat, lon = float(lat), float(lon)
+        if india_boundary is not None and not india_boundary.covers(Point(lon, lat)):
+            continue
+        rows.append({
+            "name": tags.get("name") or tags.get("industrial") or tags.get("landuse") or "Unnamed industrial feature",
+            "kind": tags.get("industrial") or tags.get("power") or tags.get("landuse") or tags.get("man_made") or "industrial",
+            "lat": lat, "lon": lon, "osm_id": element.get("id"), "osm_type": element.get("type"),
+        })
+    return rows
+
+
+def _merge_osm_sites(*collections):
+    merged = {}
+    for sites in collections:
+        for site in sites:
+            osm_id = site.get("osm_id")
+            osm_type = site.get("osm_type") or "feature"
+            identity = str(osm_id) if osm_type == "cached" else f"{osm_type}/{osm_id}"
+            merged[identity] = site
+    return list(merged.values())
+
+
+def fetch_osm(firms=None):
     boundary_query = """
-    [out:json][timeout:120];
+    [out:json][timeout:20];
     relation["ISO3166-1"="IN"][admin_level=2]->.india_boundary;
     .india_boundary out geom;
     """
@@ -380,7 +734,7 @@ def fetch_osm():
     boundary_source = "OSM"
     india_boundary = None
     try:
-        boundary_response, _ = _post_overpass(boundary_query, timeout=150)
+        boundary_response, _ = _post_overpass(boundary_query, timeout=28)
         boundary_element = next((
             element for element in boundary_response.json().get("elements", [])
             if element.get("type") == "relation" and element.get("tags", {}).get("ISO3166-1") == "IN"
@@ -400,52 +754,75 @@ def fetch_osm():
                 f"{_safe_request_error(fallback_exc)}"
             ) from exc
 
-    sites_query = """
-    [out:json][timeout:180];
-    area["ISO3166-1"="IN"][admin_level=2]->.india;
-    (
-      nwr["industrial"](area.india);
-      nwr["landuse"="industrial"](area.india);
-      nwr["power"~"plant|generator"](area.india);
-      nwr["man_made"="works"](area.india);
-    ); out center tags;
-    """
+    query_groups = _osm_search_groups(firms, india_boundary)
+    if not query_groups:
+        return [], india_boundary, True, "", boundary_source, "", "NO_HOTSPOTS", ""
+
     site_endpoint = ""
-    try:
-        sites_response, site_endpoint = _post_overpass(sites_query, timeout=210)
-        site_elements = sites_response.json().get("elements", [])
-    except Exception as exc:
-        error = _safe_request_error(exc)
-        if boundary_error:
-            error = f"India boundary fallback in use ({boundary_error}); site lookup failed ({error})"
-        logging.warning("OpenStreetMap industrial site layer unavailable: %s", error)
-        return [], india_boundary, False, error, boundary_source, site_endpoint
-    rows = []
-    seen = set()
-    for element in site_elements:
-        tags = element.get("tags", {})
-        identity = (element.get("type"), element.get("id"))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if "lat" in element and "lon" in element:
-            lat, lon = element["lat"], element["lon"]
+    live_rows = []
+    errors = []
+    successful_batches = 0
+    consecutive_failed_batches = 0
+    batches = [query_groups[i:i + OSM_QUERY_BATCH_SIZE] for i in range(0, len(query_groups), OSM_QUERY_BATCH_SIZE)]
+    for batch_index, batch in enumerate(batches):
+        batch_succeeded = False
+        try:
+            response, site_endpoint = _post_overpass(_osm_sites_query(batch), timeout=35)
+            live_rows.extend(_osm_elements_to_sites(response.json().get("elements", []), india_boundary))
+            successful_batches += 1
+            batch_succeeded = True
+        except Exception as exc:
+            errors.append(f"area batch {batch_index + 1}: {_safe_request_error(exc)}")
+            logging.warning("OpenStreetMap nearby-site batch %s/%s failed: %s", batch_index + 1, len(batches), errors[-1])
+            # Smaller batches can succeed where the first combined query timed out.
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                for smaller_batch in (batch[:midpoint], batch[midpoint:]):
+                    try:
+                        response, site_endpoint = _post_overpass(_osm_sites_query(smaller_batch), timeout=35)
+                        live_rows.extend(_osm_elements_to_sites(response.json().get("elements", []), india_boundary))
+                        successful_batches += 1
+                        batch_succeeded = True
+                    except Exception as split_exc:
+                        errors.append(f"split area batch: {_safe_request_error(split_exc)}")
+        if batch_succeeded:
+            consecutive_failed_batches = 0
         else:
-            center_point = element.get("center", {})
-            lat, lon = center_point.get("lat"), center_point.get("lon")
-        if lat is None or lon is None:
-            continue
-        rows.append({
-            "name": tags.get("name") or tags.get("industrial") or tags.get("landuse") or "Unnamed industrial feature",
-            "kind": tags.get("industrial") or tags.get("power") or tags.get("landuse") or tags.get("man_made") or "industrial",
-            "lat": lat, "lon": lon, "osm_id": element.get("id"),
-            "osm_type": element.get("type"),
-        })
+            consecutive_failed_batches += 1
+            if consecutive_failed_batches >= 2:
+                logging.warning("Stopping nearby-site queries after two consecutive failed area batches")
+                break
+
+    live_rows = _merge_osm_sites(live_rows)
+    if live_rows:
+        try:
+            _save_osm_site_cache(live_rows)
+        except Exception:
+            logging.exception("Could not save the local OpenStreetMap site cache")
+    try:
+        cached_rows, cache_updated_at = _load_osm_site_cache()
+    except Exception:
+        logging.exception("Could not read the local OpenStreetMap site cache")
+        cached_rows, cache_updated_at = [], ""
+    if india_boundary is not None:
+        cached_rows = [site for site in cached_rows if india_boundary.covers(Point(float(site["lon"]), float(site["lat"])))]
+    rows = _merge_osm_sites(cached_rows, live_rows)
+    if successful_batches and errors:
+        site_mode = "PARTIAL"
+    elif successful_batches:
+        site_mode = "LIVE"
+    elif cached_rows:
+        site_mode = "CACHED"
+    else:
+        site_mode = "SITE_CONTEXT_UNAVAILABLE"
+    site_error = " | ".join(errors[:3])
+    if boundary_error:
+        site_error = f"Boundary fallback detail: {boundary_error}" + (f"; site lookup: {site_error}" if site_error else "")
     logging.warning(
-        "OpenStreetMap site query via %s returned %s tagged features; %s had usable coordinates",
-        site_endpoint, len(site_elements), len(rows),
+        "OpenStreetMap nearby-site lookup: %s; queried %s hotspot areas, loaded %s live and %s cached sites",
+        site_mode, len(query_groups), len(live_rows), len(cached_rows),
     )
-    return rows, india_boundary, True, boundary_error, boundary_source, site_endpoint
+    return rows, india_boundary, site_mode != "SITE_CONTEXT_UNAVAILABLE", site_error, boundary_source, site_endpoint, site_mode, cache_updated_at
 
 
 def _empty_analysis():
@@ -454,7 +831,10 @@ def _empty_analysis():
         "satellite_name", "sensor_name", "source_id", "confidence", "instrument",
         "datetime_utc", "fire_type", "nearest_name", "nearest_kind", "distance_km",
         "nearby_features", "inside_industrial_buffer", "temp_anomaly", "anomaly_score",
-        "risk_score", "classification", "classification_basis", "persistence_days",
+        "historical_sample_count", "historical_sample_days", "historical_baseline_frp",
+        "historical_baseline_temp", "historical_frp_delta", "historical_frp_change_pct",
+        "historical_temp_delta", "historical_anomaly_score", "risk_score",
+        "classification", "classification_basis", "persistence_days",
         "incident_id", "incident_detections", "incident_peak_frp", "incident_satellites", "incident_first_seen",
         "incident_last_seen",
     ]
@@ -473,29 +853,48 @@ def _classify_hotspot(row):
     frp = float(row.get("frp") or 0)
     daynight = str(row.get("daynight") or "").upper()
     satellite_confidence = str(row.get("confidence") or "").lower()
+    history_days = int(row.get("historical_sample_days") or 0)
+    history_score = _finite_or_none(row.get("historical_anomaly_score")) or 0.0
+
+    def result(label, basis):
+        if history_days >= HISTORY_MIN_DAYS:
+            baseline = _finite_or_none(row.get("historical_baseline_frp"))
+            delta = _finite_or_none(row.get("historical_frp_delta"))
+            change = _finite_or_none(row.get("historical_frp_change_pct"))
+            if baseline is not None and delta is not None:
+                change_text = f" ({change:+.0f}%)" if change is not None else ""
+                basis += (
+                    f" Historical comparison: FRP {delta:+.1f} MW{change_text} versus the "
+                    f"{baseline:.1f} MW median from {history_days} prior active dates; "
+                    "this same-satellite comparison is an anomaly clue, not a confirmed cause."
+                )
+            elif history_score >= 0.5:
+                basis += f" Historical thermal anomaly score {history_score:.2f} from {history_days} prior dates."
+        return label, basis
+
     if fire_type == 1:
-        return "Volcanic or geothermal source", "FIRMS type 1: active volcano source"
+        return result("Volcanic or geothermal source", "FIRMS type 1: active volcano source")
     if fire_type == 2 and distance <= 3 and persistence >= 3:
-        return "Persistent industrial heat / gas flare", "FIRMS type 2 static land source near a mapped site on multiple dates"
+        return result("Persistent industrial heat / gas flare", "FIRMS type 2 static land source near a mapped site on multiple dates")
     if fire_type == 2 and distance <= 10:
-        return "Suspected industrial incident", "FIRMS type 2 static land source near a mapped industrial or power site"
+        return result("Suspected industrial incident", "FIRMS type 2 static land source near a mapped industrial or power site")
     if fire_type == 0:
         if frp <= 8 and daynight == "D":
-            return "Agricultural or open burn", "Low-FRP daytime vegetation detection; open or agricultural burning is a heuristic"
-        return "Vegetation fire", "FIRMS type 0: presumed vegetation fire"
+            return result("Agricultural or open burn", "Low-FRP daytime vegetation detection; open or agricultural burning is a heuristic")
+        return result("Vegetation fire", "FIRMS type 0: presumed vegetation fire")
     if fire_type == 3:
-        return "Unknown / needs review", "FIRMS type 3 offshore detection; no land-fire cause assigned"
+        return result("Unknown / needs review", "FIRMS type 3 offshore detection; no land-fire cause assigned")
     if fire_type == 2:
-        return "Unknown / needs review", "FIRMS type 2 static land source; no nearby mapped site confirms its cause"
+        return result("Unknown / needs review", "FIRMS type 2 static land source; no nearby mapped site confirms its cause")
     if distance <= 3 and persistence >= 3:
-        return "Persistent industrial heat / gas flare", "Repeated hotspot near a mapped site; candidate requires review"
+        return result("Persistent industrial heat / gas flare", "Repeated hotspot near a mapped site; candidate requires review")
     if distance <= 5 and frp >= 20:
-        return "Suspected industrial incident", "High-FRP hotspot near a mapped site; candidate requires review"
+        return result("Suspected industrial incident", "High-FRP hotspot near a mapped site; candidate requires review")
     if frp <= 8 and daynight == "D":
-        return "Agricultural or open burn", "Low-FRP daytime hotspot; open or agricultural burning is a heuristic"
+        return result("Agricultural or open burn", "Low-FRP daytime hotspot; open or agricultural burning is a heuristic")
     if frp >= 8 and satellite_confidence in {"h", "high", "n", "nominal"}:
-        return "Vegetation fire", "FIRMS confidence and FRP suggest a vegetation fire; cause is not field-verified"
-    return "Unknown / needs review", "FIRMS source type is unavailable or evidence is inconclusive"
+        return result("Vegetation fire", "FIRMS confidence and FRP suggest a vegetation fire; cause is not field-verified")
+    return result("Unknown / needs review", "FIRMS source type is unavailable or evidence is inconclusive")
 
 
 def _assign_incidents(events):
@@ -538,6 +937,7 @@ def _assign_incidents(events):
 
 def analyze(firms, facilities, buffer_km, india_boundary=None):
     firms = normalize_firms(firms)
+    firms = _history_columns(firms)
     if india_boundary is not None and not firms.empty:
         inside_india = [india_boundary.covers(Point(lon, lat)) for lat, lon in zip(firms.latitude, firms.longitude)]
         firms = firms.loc[inside_india].reset_index(drop=True)
@@ -650,8 +1050,10 @@ def analyze(firms, facilities, buffer_km, india_boundary=None):
         events["anomaly_score"] = (.45 * frp + .35 * events["inside_score"] + .20 * proximity).clip(0, 1)
 
     temp_normalized = events["temp_anomaly"].fillna(0) / max(float(events["temp_anomaly"].fillna(0).max()), 1)
+    historical_score = pd.to_numeric(events["historical_anomaly_score"], errors="coerce").fillna(0).clip(0, 1)
     events["risk_score"] = (
-        100 * (.45 * events["anomaly_score"] + .30 * events["inside_score"] + .15 * proximity + .10 * temp_normalized)
+        100 * (.35 * events["anomaly_score"] + .25 * events["inside_score"] + .12 * proximity
+               + .08 * temp_normalized + .20 * historical_score)
     ).clip(0, 100)
     classifications = events.apply(_classify_hotspot, axis=1)
     events["classification"] = [value[0] for value in classifications]
@@ -715,7 +1117,10 @@ def clean_events(out):
         "latitude", "longitude", "datetime_utc", "frp", "bright_ti4", "bright_ti5",
         "confidence", "daynight", "satellite", "satellite_name", "sensor_name", "source_id", "instrument",
         "fire_type", "nearest_name", "nearest_kind", "distance_km", "nearby_features",
-        "inside_industrial_buffer", "temp_anomaly", "anomaly_score", "risk_score",
+        "inside_industrial_buffer", "temp_anomaly", "anomaly_score", "historical_sample_count",
+        "historical_sample_days", "historical_baseline_frp", "historical_baseline_temp",
+        "historical_frp_delta", "historical_frp_change_pct", "historical_temp_delta",
+        "historical_anomaly_score", "risk_score",
         "classification", "classification_basis", "persistence_days", "incident_id",
         "incident_detections", "incident_peak_frp", "incident_satellites", "incident_first_seen", "incident_last_seen",
     ]
@@ -779,11 +1184,13 @@ def fetch_selected_feeds(key, selection, period, days, start_date=None):
 def _run_analysis(key, selection, period, days, buffer_km, start_date=None):
     firms, feed_status = fetch_selected_feeds(key, selection, period, days, start_date)
     try:
-        facilities, india_boundary, osm_sites_available, osm_error, boundary_source, osm_endpoint = fetch_osm()
-        osm_mode = "LIVE" if osm_sites_available else "SITE_CONTEXT_UNAVAILABLE"
+        facilities, india_boundary, osm_sites_available, osm_error, boundary_source, osm_endpoint, osm_mode, osm_cache_updated_at = fetch_osm(firms)
     except Exception as exc:
         raise ValueError(f"India boundary and industrial context could not be loaded, so detections were not shown: {_safe_request_error(exc)}")
-    events, _ = analyze(firms, facilities, buffer_km, india_boundary=india_boundary)
+    india_firms = _clip_firms_to_boundary(firms, india_boundary)
+    excluded_outside_india = max(0, len(firms) - len(india_firms))
+    india_firms, history_context = add_local_historical_context(india_firms)
+    events, _ = analyze(india_firms, facilities, buffer_km, india_boundary=india_boundary)
     actual_start = start_date or (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
     actual_end = (datetime.strptime(actual_start, "%Y-%m-%d").date() + timedelta(days=days - 1)).isoformat()
     return {
@@ -793,7 +1200,9 @@ def _run_analysis(key, selection, period, days, buffer_km, start_date=None):
         "source_status": feed_status, "osm_mode": osm_mode, "osm_error": osm_error,
         "boundary_source": boundary_source, "osm_endpoint": osm_endpoint,
         "osm_feature_count": len(facilities),
-        "excluded_outside_india": max(0, len(firms) - len(events)),
+        "osm_cache_updated_at": osm_cache_updated_at,
+        "history_context": history_context,
+        "excluded_outside_india": excluded_outside_india,
         "events": clean_events(events), "facilities": facilities, "paths": movement(events),
     }
 

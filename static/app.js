@@ -168,7 +168,8 @@ function render() {
   document.getElementById('countOsm').textContent = data.facilities.length.toLocaleString();
   document.getElementById('countOsmLabel').textContent = queryInfo.mode === 'DEMO'
     ? 'Illustrative demo points'
-    : queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? 'OSM sites unavailable' : 'OSM industrial features';
+    : queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? 'OSM sites unavailable'
+      : queryInfo.osm_mode === 'CACHED' ? 'Cached OSM features' : 'OSM industrial features';
   document.getElementById('facilityLegendLabel').textContent = queryInfo.mode === 'DEMO'
     ? 'Illustrative demo reference point'
     : queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? 'OSM sites unavailable' : 'OSM industrial / power site';
@@ -178,11 +179,24 @@ function render() {
   const mapNote = document.getElementById('mapPointNote');
   const excluded = Number(queryInfo.excluded_outside_india || 0);
   const osmLoaded = Number(queryInfo.osm_feature_count ?? data.facilities.length);
+  const history = queryInfo.history_context || {};
+  const baselineStatus = document.getElementById('baselineStatus');
+  baselineStatus.textContent = queryInfo.mode === 'DEMO'
+    ? 'Demo does not create historical baselines. Load live or historical FIRMS data to build a local baseline.'
+    : history.available === false
+      ? 'The local history database could not be read or updated; historical anomaly comparisons are unavailable.'
+      : `Local history: ${Number(history.stored_observations || 0).toLocaleString()} observations across ${Number(history.stored_days || 0).toLocaleString()} dates. Baselines compare prior same-satellite detections within 1.5 km, same day/night, and within 2 hours of the overpass; at least 3 prior dates are needed. FIRMS contains hotspot detections, not confirmed no-fire days.`;
   const osmStatus = queryInfo.mode === 'DEMO' ? ''
     : queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? ' OSM industrial-site distances and site-based classifications are unavailable.'
-      : ` OpenStreetMap loaded ${osmLoaded.toLocaleString()} mapped industrial/power sites${queryInfo.osm_endpoint ? ` via ${escapeHtml(queryInfo.osm_endpoint)}` : ''}; nearest-site search covers 100 km.`
-        + (osmLoaded === 0 ? ' No site-based classification can be made until mapped sites are returned.' : '');
-  mapNote.innerHTML = `Showing ${mapEvents.length.toLocaleString()} of ${filtered.length.toLocaleString()} hotspot groups. Groups combine nearby detections; each list entry shows the satellites and dates observed.${queryInfo.mode === 'DEMO' ? ' Demo only: these are synthetic examples, not NASA FIRMS observations. Enter a MAP_KEY and click Load live data for satellite detections.' : ''}${excluded ? ` ${excluded.toLocaleString()} detections outside India's boundary were excluded.` : ''}${queryInfo.boundary_source === 'NATURAL_EARTH_OFFLINE' ? ' Using the bundled Natural Earth India boundary because the live OSM boundary service is unavailable.' : ''}${osmStatus}`;
+      : queryInfo.osm_mode === 'CACHED'
+        ? ` Overpass is timing out; using ${osmLoaded.toLocaleString()} previously cached OpenStreetMap sites${queryInfo.osm_cache_updated_at ? ` (cache updated ${escapeHtml(String(queryInfo.osm_cache_updated_at).slice(0, 10))})` : ''}. This is partial coverage.`
+        : ` OpenStreetMap loaded ${osmLoaded.toLocaleString()} mapped industrial/power sites${queryInfo.osm_endpoint ? ` via ${escapeHtml(queryInfo.osm_endpoint)}` : ''}; nearest-site search covers 100 km.`
+          + (queryInfo.osm_mode === 'PARTIAL' ? ' Some nearby area queries timed out; cached and returned sites are shown.' : '')
+          + (osmLoaded === 0 ? ' No site-based classification can be made until mapped sites are returned.' : '');
+  const osmDiagnostic = queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' && queryInfo.osm_error
+    ? `<details class="detail-note"><summary>OpenStreetMap service error details</summary><small>${escapeHtml(queryInfo.osm_error)}</small></details>`
+    : '';
+  mapNote.innerHTML = `Showing ${mapEvents.length.toLocaleString()} of ${filtered.length.toLocaleString()} hotspot groups. Groups combine nearby detections; each list entry shows the satellites and dates observed.${queryInfo.mode === 'DEMO' ? ' Demo only: these are synthetic examples, not NASA FIRMS observations. Enter a MAP_KEY and click Load live data for satellite detections.' : ''}${excluded ? ` ${excluded.toLocaleString()} detections outside India's boundary were excluded.` : ''}${queryInfo.boundary_source === 'NATURAL_EARTH_OFFLINE' ? ' Using the bundled Natural Earth India boundary because the live OSM boundary service is unavailable.' : ''}${osmStatus}${osmDiagnostic}`;
 
   const body = document.getElementById('eventsBody');
   const tableRows = filtered.slice(0, TABLE_ROW_LIMIT);
@@ -203,7 +217,7 @@ function render() {
       <td>${escapeHtml(event.nearest_name || (queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? 'OSM unavailable' : '—'))}<small class="subcell">${escapeHtml(event.nearest_kind || (queryInfo.mode === 'DEMO' ? 'Illustrative demo context' : 'Mapped industrial/site feature'))}</small></td>
       <td>${queryInfo.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' ? 'OSM context unavailable' : event.distance_km !== null && event.distance_km !== undefined && Number.isFinite(Number(event.distance_km)) ? `${num(event.distance_km, 2)} km` : 'No mapped site within 100 km'}</td>
       <td>${event.inside_industrial_buffer ? 'YES' : 'NO'}</td>
-      <td>${num(event.risk_score, 1)}</td>
+      <td>${num(event.risk_score, 1)}<small class="subcell">History anomaly ${Number(event.historical_sample_days || 0) >= 3 ? num(event.historical_anomaly_score, 2) : 'building baseline'}</small></td>
       <td><span class="badge ${badgeClass}">${escapeHtml(classification)}</span></td>
     </tr>`;
   }).join('');
@@ -264,12 +278,17 @@ function showDetail(event) {
   }).join('');
   const start = event.incident_first_seen ? new Date(event.incident_first_seen).toLocaleString() : '—';
   const end = event.incident_last_seen ? new Date(event.incident_last_seen).toLocaleString() : '—';
+  const historyDays = Number(event.historical_sample_days || 0);
+  const baselineDetails = historyDays >= 3 && event.historical_baseline_frp !== null && event.historical_baseline_frp !== undefined
+    ? `${historyDays} earlier dates · FRP median ${num(event.historical_baseline_frp)} MW · current FRP change ${num(event.historical_frp_delta, 1)} MW (${num(event.historical_frp_change_pct, 0)}%) · brightness-difference change ${num(event.historical_temp_delta, 1)} K · anomaly score ${num(event.historical_anomaly_score, 2)}/1.00.`
+    : `${historyDays} earlier active dates match this satellite and overpass. At least 3 are needed for a baseline. Load historical date ranges to seed local history.`;
   document.getElementById('detail').innerHTML = `<div class="detail-grid">
     <div class="detail-item"><small>Hotspot group</small><b>${escapeHtml(event.incident_id || '—')}</b></div>
     <div class="detail-item"><small>Detection records / satellites</small><b>${Number(event.incident_detections || members.length || 1).toLocaleString()} · ${escapeHtml(satelliteNames.join(', ') || 'Unknown')}</b></div>
     <div class="detail-item"><small>FIRMS feed</small><b>${escapeHtml(event.source_id || '—')}</b></div>
     <div class="detail-item"><small>Classification</small><b>${escapeHtml(event.classification)}</b></div>
     <div class="detail-item"><small>Risk score</small><b>${num(event.risk_score, 1)}/100</b></div>
+    <div class="detail-item"><small>Historical anomaly score</small><b>${historyDays >= 3 ? `${num(event.historical_anomaly_score, 2)}/1.00` : 'Building baseline'}</b></div>
     <div class="detail-item"><small>Latest FRP / FIRMS type</small><b>${num(event.frp, 1)} MW · ${event.fire_type === null || event.fire_type === undefined ? 'unavailable' : escapeHtml(event.fire_type)}</b></div>
     <div class="detail-item"><small>Brightness / day-night</small><b>${num(event.bright_ti4, 1)} K · ${num(event.bright_ti5, 1)} K · ${escapeHtml(event.daynight || '—')}</b></div>
     <div class="detail-item"><small>Confidence</small><b>${escapeHtml(event.confidence || '—')}</b></div>
@@ -280,6 +299,7 @@ function showDetail(event) {
     <div class="detail-item"><small>Observed span / active days</small><b>${escapeHtml(start)} – ${escapeHtml(end)} · ${Number(event.persistence_days || 1)} day(s)</b></div>
   </div>
   <div class="detail-section"><b>Why it received this label</b><p>${escapeHtml(event.classification_basis || 'Rule-based candidate label; review the source measurements.')}</p></div>
+  <div class="detail-section"><b>Historical heat baseline</b><p>${escapeHtml(baselineDetails)}</p><small class="detail-note">Comparison uses prior hotspot detections from the same satellite near this location, at a similar overpass time and day/night. It does not measure a factory’s complete operating temperature or treat missing detections as zero activity.</small></div>
   <div class="detail-section"><b>${queryInfo.mode === 'DEMO' ? 'Illustrative demo context' : 'Nearby mapped sites · straight-line distance'}</b>${nearbyHtml}</div>
   <div class="detail-section"><b>Satellite observations (${observations.length.toLocaleString()})</b><p class="detail-note">FIRMS reports the approximate center of a satellite pixel; the hotspot point is not a surveyed fire perimeter.</p><ul class="observation-list">${observationHtml || '<li>No observation details available.</li>'}</ul>${observations.length > 12 ? `<small class="detail-note">Showing 12 of ${observations.length.toLocaleString()} observations. CSV export contains every detection.</small>` : ''}</div>`;
 }
@@ -427,13 +447,15 @@ async function loadData(mode) {
       setStatus(`Partial feed · ${succeeded}/${feedStatus.length} loaded`, true);
       alert(`Some satellite feeds were unavailable. Loaded ${succeeded} of ${feedStatus.length}. Check the feed status below the history chart.`);
     } else if (mode === 'live' || result.mode === 'LIVE') {
-      setStatus(query.period === 'historical' ? 'Historical NASA FIRMS data' : 'Live NASA FIRMS data', true);
+      const dataLabel = query.period === 'historical' ? 'Historical NASA FIRMS data' : 'Live NASA FIRMS data';
+      const osmUnavailable = result.osm_mode === 'SITE_CONTEXT_UNAVAILABLE';
+      const osmPartial = result.osm_mode === 'PARTIAL';
+      setStatus(
+        `${dataLabel}${osmUnavailable ? ' · OSM unavailable' : osmPartial ? ' · OSM partial' : ''}`,
+        !osmUnavailable && !osmPartial,
+      );
     } else {
       setStatus('Demo only · synthetic data');
-    }
-    if (result.osm_mode === 'SITE_CONTEXT_UNAVAILABLE' && succeeded > 0) {
-      const osmDetails = result.osm_error ? `\n\nOSM error: ${result.osm_error}` : '';
-      alert(`Satellite detections were clipped to India and loaded, but OpenStreetMap context is unavailable. ${result.boundary_source === 'NATURAL_EARTH_OFFLINE' ? 'The bundled Natural Earth boundary is being used.' : 'The live India boundary was available.'} Industrial-site distances and site-based classifications will return when an OSM service is reachable.${osmDetails}`);
     }
   } catch (error) {
     console.error(error);
@@ -575,6 +597,8 @@ document.getElementById('exportBtn').addEventListener('click', () => {
     'latitude', 'longitude', 'datetime_utc', 'satellite_name', 'source_id', 'sensor_name',
     'satellite', 'instrument', 'confidence', 'daynight', 'fire_type', 'frp', 'bright_ti4', 'bright_ti5', 'persistence_days',
     'nearest_name', 'nearest_kind', 'distance_km', 'nearby_features', 'inside_industrial_buffer',
+    'historical_sample_count', 'historical_sample_days', 'historical_baseline_frp', 'historical_baseline_temp',
+    'historical_frp_delta', 'historical_frp_change_pct', 'historical_temp_delta', 'historical_anomaly_score',
     'classification', 'classification_basis', 'risk_score'
   ];
   const csv = ['\ufeff' + columns.map(csvCell).join(','), ...rows.map(row => columns.map(column => {
