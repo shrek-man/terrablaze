@@ -3,14 +3,14 @@ setlocal
 cd /d "%~dp0"
 
 echo ================================================
-echo   THERMAL INTELLIGENCE - SIH 2026
-ECHO ================================================
+echo   THERMALTRACE - INDIA FIRE MONITORING
+echo ================================================
 echo.
 
 where py >nul 2>nul
 if errorlevel 1 (
   echo Python launcher ^(py^) was not found.
-  echo Install Python 3.11+ from python.org and try again.
+  echo Install Python 3.11 or newer from python.org and try again.
   pause
   exit /b 1
 )
@@ -26,8 +26,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo Installing required packages...
-.venv\Scripts\python.exe -m pip install --upgrade pip
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 (
   echo.
   echo Package installation failed. Check your internet connection.
@@ -36,11 +35,13 @@ if errorlevel 1 (
 )
 
 echo.
-set /p FIRMSKEY=Optional - paste NASA FIRMS MAP_KEY now (press Enter to enter it on the website):
-if not "%FIRMSKEY%"=="" echo NASA_FIRMS_MAP_KEY=%FIRMSKEY%>.env
-echo.
-echo Starting the website...
-start "" cmd /c "timeout /t 3 /nobreak >nul && start http://127.0.0.1:8000"
+echo The NASA FIRMS key can be entered in the website. It is not needed for demo mode.
+echo Starting the website at http://127.0.0.1:8000 ...
+start "" powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0open_browser.ps1"
 .venv\Scripts\python.exe -m uvicorn backend:app --host 127.0.0.1 --port 8000
 
-pause
+if errorlevel 1 (
+  echo.
+  echo The website stopped with an error. Read the message above for details.
+  pause
+)

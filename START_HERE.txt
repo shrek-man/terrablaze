@@ -1,10 +1,12 @@
-THERMAL INTELLIGENCE — SIH 2026
+THERMALTRACE — INDIA-WIDE SATELLITE FIRE MONITORING
 
-1. Extract the ZIP.
-2. Double-click RUN_WEBSITE.bat.
-3. Wait for the first-time package installation.
-4. The browser opens at http://127.0.0.1:8000.
-5. Click Load live data. The website asks for the NASA FIRMS MAP_KEY if one is not already in this browser session.
+1. Extract this ZIP.
+2. Double-click RUN_WEBSITE.bat and keep its terminal open.
+3. Wait for the browser to open at http://127.0.0.1:8000.
+4. The app starts in **Demo only** mode with synthetic sample points, not live NASA data. If the terminal shows `GET /api/demo`, it is serving this sample data.
+5. For live data, get a NASA FIRMS MAP_KEY, paste it into the key field or choose a .txt file containing only the key, then click Load live data.
+6. Choose Recent for near-real-time feeds or Historical to select a start date and inspect the standard archive. “All available satellite feeds” combines every feed NASA lists for that period.
 
-You do NOT need to activate the virtual environment manually.
-Keep the black terminal window open while the website is running.
+To fetch NASA data, save your MAP_KEY and click **Load live data**. The terminal should then show `POST /api/analyze`. Nearby detections are grouped into hotspot histories; select a row to zoom to it and see observation dates, satellites, measurements, classification evidence, and distances to nearby mapped industrial/power sites. NASA's rectangular results are clipped to India's boundary. The app tries alternate Overpass servers; if none is reachable, detections use the bundled generalized Natural Earth outline and site distances remain unavailable.
+
+Labels are candidate categories, not field-confirmed causes. Distance is straight-line to mapped sites, and satellite points are approximate pixel centers. The key stays in this browser tab's session storage; use Clear saved key to remove it.

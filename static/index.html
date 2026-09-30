@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Thermal Intelligence | SIH 2026</title>
+<title>ThermalTrace | India-wide satellite fire monitoring</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -12,8 +12,8 @@
   <div class="brand">
     <div class="logo">🔥</div>
     <div>
-      <h1>Thermal Intelligence</h1>
-      <p>SIH 2026 · Bengaluru Industrial Fire Monitoring</p>
+      <h1>ThermalTrace</h1>
+      <p>India-wide satellite fire monitoring</p>
     </div>
   </div>
   <div class="status"><span id="statusDot"></span><span id="statusText">Demo mode</span></div>
@@ -25,24 +25,34 @@
       <h2>Data Sources</h2>
       <div class="statusbox"><span>FIRMS key</span><b id="keyStatus">Not set</b></div>
       <label>NASA FIRMS MAP_KEY</label>
-      <div class="key-row"><input id="firmsKey" type="password" placeholder="Paste MAP_KEY" autocomplete="off"><button id="saveKey" class="key-btn">Save</button></div>
+      <div class="key-row"><input id="firmsKey" type="password" placeholder="Paste MAP_KEY" autocomplete="off" spellcheck="false"><button id="saveKey" class="key-btn">Save key</button></div>
+      <label for="keyFile">Or load a plain-text key file</label>
+      <input id="keyFile" type="file" accept=".txt,text/plain">
       <button id="clearKey" class="text-btn">Clear saved key</button>
-      <label>Satellite source</label>
-      <select id="firmsSource">
-        <option value="VIIRS_SNPP_NRT">VIIRS SNPP NRT</option>
-        <option value="VIIRS_NOAA20_NRT">VIIRS NOAA-20 NRT</option>
-        <option value="VIIRS_NOAA21_NRT">VIIRS NOAA-21 NRT</option>
-        <option value="MODIS_NRT">MODIS NRT</option>
+      <p class="hint">Get a free key from <a href="https://firms.modaps.eosdis.nasa.gov/api/map_key/" target="_blank" rel="noopener noreferrer">NASA FIRMS</a>. Paste it here or choose a .txt file containing only the key. Select <b>Load live data</b> to send it to the local app server. It is kept in this browser tab’s session storage until you clear it.</p>
+      <label>Data period</label>
+      <select id="dataPeriod">
+        <option value="recent" selected>Recent · near real-time (NRT)</option>
+        <option value="historical">Historical · standard archive</option>
       </select>
-      <label>Days of FIRMS data</label>
-      <input id="days" type="number" min="1" max="30" value="2">
+      <label>Satellite feeds</label>
+      <select id="firmsSource">
+        <option value="ALL" selected>All available satellite feeds</option>
+      </select>
+      <p class="hint">FIRMS queries a rectangle; live hotspots are clipped to India's boundary. The app tries several OpenStreetMap Overpass servers, then uses its bundled boundary if they are unreachable. Site distances need an Overpass connection.</p>
+      <div id="historicalNote" class="hint hidden">Historical archive availability varies by satellite and date. NASA currently lists MODIS, NOAA-20, and Suomi-NPP standard products; NOAA-21 is available in the recent feed. Industrial context uses today's OpenStreetMap data, not archived infrastructure.</div>
+      <div id="historicalDateGroup" class="hidden">
+        <label for="historicalStart">Historical start date (UTC)</label>
+        <input id="historicalStart" type="date">
+      </div>
+      <label>Days in selected period</label>
+      <input id="days" type="number" min="1" max="30" value="7">
       <label>Industrial buffer (km)</label>
       <input id="bufferKm" type="number" min="1" max="15" step="0.5" value="5">
       <div class="button-row">
         <button id="loadLive" class="primary">Load live data</button>
         <button id="loadDemo">Demo</button>
       </div>
-      <p class="hint">The website will ask for your NASA FIRMS MAP_KEY when you click <b>Load live data</b>. The key is kept only in this browser session.</p>
     </section>
 
     <section class="panel">
@@ -60,33 +70,51 @@
         <div><b>NASA FIRMS</b><span>thermal anomalies</span></div>
         <div><b>OSM + Overpass</b><span>industrial context</span></div>
         <div><b>GeoPandas + Shapely</b><span>buffer · join · distance</span></div>
-        <div><b>Temporal analysis</b><span>movement · persistence</span></div>
+        <div><b>Temporal analysis</b><span>time-sorted detection paths</span></div>
         <div><b>scikit-learn</b><span>prototype anomaly score</span></div>
-        <div><b>Folium/Leaflet UI</b><span>interactive map</span></div>
+        <div><b>Leaflet UI</b><span>interactive map</span></div>
       </div>
     </section>
   </aside>
 
   <section class="content">
     <div class="cards">
-      <div class="card"><span>Thermal detections</span><strong id="countDetections">0</strong></div>
-      <div class="card"><span>OSM industrial features</span><strong id="countOsm">0</strong></div>
+        <div class="card"><span>Unique hotspot groups</span><strong id="countDetections">0</strong></div>
+        <div class="card"><span>Detection records</span><strong id="countRawDetections">0</strong></div>
+      <div class="card"><span id="countOsmLabel">OSM industrial features</span><strong id="countOsm">0</strong></div>
       <div class="card"><span>Inside buffer</span><strong id="countBuffer">0</strong></div>
       <div class="card"><span>High-risk anomalies</span><strong id="countHigh">0</strong></div>
       <div class="card"><span>Movement paths</span><strong id="countPaths">0</strong></div>
     </div>
 
+    <section class="panel history-panel">
+      <div class="panel-title">
+        <div>
+          <h2>Historical context</h2>
+          <p class="history-caption">Daily detections by satellite across the selected date window</p>
+        </div>
+        <strong id="historySummary">Load data to view the trend</strong>
+      </div>
+      <div id="historyChart" class="history-chart"><div class="empty">The daily trend will appear here.</div></div>
+      <div id="historyLegend" class="history-legend"></div>
+      <div id="feedStatus" class="feed-status"></div>
+    </section>
+
     <div class="map-panel">
       <div class="map-header">
         <div>
           <h2>GIS Intelligence Map</h2>
-          <p>FIRMS anomalies enriched with OSM infrastructure and spatial analysis</p>
+          <p>India-only hotspot groups, satellite history, and distance to mapped industrial sites</p>
+          <p id="mapPointNote" class="map-count-note">Map points will be listed after data loads.</p>
         </div>
-        <div class="legend">
-          <span><i class="dot thermal"></i> Thermal</span>
-          <span><i class="dot high"></i> High risk</span>
-          <span><i class="dot facility"></i> OSM industrial</span>
-          <span class="line-key">━━ movement</span>
+        <div class="legend classification-legend">
+          <span><i class="dot class-persistent"></i> Persistent industrial heat / gas flare</span>
+          <span><i class="dot class-industrial"></i> Suspected industrial incident</span>
+          <span><i class="dot class-vegetation"></i> Vegetation fire</span>
+          <span><i class="dot class-openburn"></i> Agricultural or open burn</span>
+          <span><i class="dot class-volcanic"></i> Volcanic or geothermal source</span>
+          <span><i class="dot class-unknown"></i> Unknown / needs review</span>
+          <span><i class="dot facility"></i> <span id="facilityLegendLabel">OSM industrial / power site</span></span>
         </div>
       </div>
       <div id="map"></div>
@@ -94,11 +122,11 @@
 
     <div class="lower">
       <section class="panel table-panel">
-        <div class="panel-title"><h2>Detection Analysis</h2><button id="exportBtn">Export CSV</button></div>
+        <div class="panel-title"><div><h2>Detection Analysis</h2><small id="tableSummary" class="table-summary"></small></div><button id="exportBtn">Export CSV</button></div>
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th>Time</th><th>FRP</th><th>Nearest facility</th><th>Distance</th><th>Buffer</th><th>Risk</th><th>Classification</th>
+              <th>Hotspot group / date span</th><th>Satellite(s) / records</th><th>Peak FRP</th><th>Nearest site / reference point</th><th>Distance to site</th><th>Buffer</th><th>Risk</th><th>Classification</th>
             </tr></thead>
             <tbody id="eventsBody"></tbody>
           </table>
@@ -108,7 +136,7 @@
       <section class="panel detail-panel">
         <h2>Selected Detection</h2>
         <div id="detail">
-          <div class="empty">Click a thermal point on the map.</div>
+          <div class="empty">Click a hotspot group in the list or on the map to zoom in and inspect its satellite observations and nearby sites.</div>
         </div>
       </section>
     </div>
@@ -116,7 +144,7 @@
 </main>
 
 <footer>
-  <span>Prototype: thermal anomaly ≠ confirmed fire.</span>
+  <span>Classification labels are evidence-based candidates, not confirmed causes. Satellite hotspot detections can repeat across feeds and dates.</span>
   <span>Data: NASA FIRMS · OpenStreetMap/Overpass · GeoPandas · Shapely · scikit-learn</span>
 </footer>
 
